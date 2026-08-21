@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { supabase } from "@/lib/supabase";
 
 /* ------------------------------------------------------------------ */
 /*  Type definitions                                                    */
@@ -14,23 +15,43 @@ type Task = {
 
 type Filter = "all" | "active" | "completed";
 
-const STORAGE_KEY = "todo-app-tasks-v1";
+const STORAGE_KEY = "***";
 
 /* ------------------------------------------------------------------ */
-/*  Utility: generate a unique id                                       */
+/*  Supabase mapping (DB row <-> local Task)                            */
 /* ------------------------------------------------------------------ */
-function createId(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+type DbTask = {
+  id: string;
+  text: string;
+  completed: boolean;
+  created_at: string;
+};
+
+/* ------------------------------------------------------------------ */
+/*  Load initial tasks from Supabase (cache in localStorage)           */
+/*  Returns a promise so we hydrate once on mount.                     */
+/* ------------------------------------------------------------------ */
+async function loadTasksFromDb(): Promise<Task[]> {
+  const { data, error } = await supabase
+    .from("tasks")
+    .select("id, text, completed, created_at")
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("Supabase load error:", error.message);
+    // fall back to localStorage cache
+    return loadTasksFromLocal();
+  }
+
+  return (data ?? []).map((t: DbTask) => ({
+    id: t.id,
+    text: t.text,
+    completed: t.completed,
+    createdAt: t.created_at ? new Date(t.created_at).getTime() : Date.now(),
+  }));
 }
 
-/* ------------------------------------------------------------------ */
-/*  Main component                                                      */
-/* ------------------------------------------------------------------ */
-/* ------------------------------------------------------------------ */
-/*  Load initial tasks from localStorage (lazy initializer)            */
-/*  Runs lazily on mount inside useState, avoiding setState-in-effect   */
-/* ------------------------------------------------------------------ */
-function loadInitialTasks(): Task[] {
+function loadTasksFromLocal(): Task[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -48,8 +69,33 @@ function loadInitialTasks(): Task[] {
   return [];
 }
 
+/* ------------------------------------------------------------------ */
+/*  Sync helpers                                                        */
+/* ------------------------------------------------------------------ */
+async function upsertToDb(tasks: Task[]): Promise<void> {
+  if (tasks.length === 0) return;
+  const rows = tasks.map((t) => ({
+    id: t.id,
+    text: t.text,
+    completed: t.completed,
+    created_at: new Date(t.createdAt).toISOString(),
+  }));
+  const { error } = await supabase.from("tasks").upsert(rows);
+  if (error) console.error("Supabase upsert error:", error.message);
+}
+
+async function deleteFromDb(ids: string[]): Promise<void> {
+  if (ids.length === 0) return;
+  const { error } = await supabase.from("tasks").delete().in("id", ids);
+  if (error) console.error("Supabase delete error:", error.message);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main component                                                      */
+/* ------------------------------------------------------------------ */
 export default function TodoPage() {
-  const [tasks, setTasks] = useState<Task[]>(loadInitialTasks);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [hydrated, setHydrated] = useState(false);
   const [input, setInput] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -58,14 +104,65 @@ export default function TodoPage() {
   const inputRef = useRef<HTMLInputElement>(null);
   const editRef = useRef<HTMLInputElement>(null);
 
-  /* ----- persist to localStorage whenever tasks change ----- */
+  /* ----- hydrate once from Supabase on mount ----- */
   useEffect(() => {
+    let cancelled = false;
+    loadTasksFromDb().then((loaded) => {
+      if (cancelled) return;
+      setTasks(loaded);
+      setHydrated(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /* ----- persist to localStorage whenever tasks change (cache) ----- */
+  useEffect(() => {
+    if (!hydrated) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
     } catch {
       /* storage unavailable — fail silently */
     }
-  }, [tasks]);
+  }, [tasks, hydrated]);
+
+  /* ----- sync to Supabase whenever tasks change -----
+     Debounced via setTimeout so setState is not called synchronously
+     inside the effect body (avoids react-hooks/set-state-in-effect).
+     A ref tracks whether a sync is in-flight to prevent overlap. */
+  const syncInFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    const t = setTimeout(async () => {
+      if (syncInFlightRef.current) return;
+      syncInFlightRef.current = true;
+      const snapshot = tasks;
+      try {
+        await upsertToDb(snapshot);
+        // purge DB rows no longer in local list
+        const ids = snapshot.map((x) => x.id);
+        if (ids.length === 0) {
+          await supabase
+            .from("tasks")
+            .delete()
+            .neq("id", "00000000-0000-0000-0000-000000000000");
+        } else {
+          const { data: remote } = await supabase
+            .from("tasks")
+            .select("id")
+            .not("id", "in", `(${ids.join(",")})`);
+          if (remote && remote.length > 0) {
+            await deleteFromDb(remote.map((r) => r.id));
+          }
+        }
+      } finally {
+        syncInFlightRef.current = false;
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [tasks, hydrated]);
 
   /* ----- keep editing input focused while editing ----- */
   useEffect(() => {
@@ -80,7 +177,7 @@ export default function TodoPage() {
     const text = input.trim();
     if (!text) return;
     setTasks((prev) => [
-      { id: createId(), text, completed: false, createdAt: Date.now() },
+      { id: crypto.randomUUID(), text, completed: false, createdAt: Date.now() },
       ...prev,
     ]);
     setInput("");
@@ -165,7 +262,7 @@ export default function TodoPage() {
             ✅ To-Do List
           </h1>
           <p className="mt-1 text-sm text-slate-500">
-            管理你嘅購物清單同待辦事項 — 資料自動儲存喺你嘅裝置
+            管理你嘅購物清單同待辦事項 — 資料同步儲存喺雲端
           </p>
 
           {/* ---------- Add form ---------- */}
@@ -223,7 +320,12 @@ export default function TodoPage() {
 
         {/* ---------- Task list ---------- */}
         <ul className="max-h-[55vh] divide-y divide-slate-100 overflow-y-auto px-4 py-2 sm:px-6">
-          {filteredTasks.length === 0 && (
+          {!hydrated ? (
+            <li className="flex flex-col items-center gap-3 py-14 text-center text-slate-400">
+              <span className="text-5xl">⏳</span>
+              <p className="font-medium text-slate-500">載入中…</p>
+            </li>
+          ) : filteredTasks.length === 0 ? (
             <li className="flex flex-col items-center gap-3 py-14 text-center text-slate-400">
               <span className="text-5xl">🗒️</span>
               <div>
@@ -237,87 +339,89 @@ export default function TodoPage() {
                 </p>
               </div>
             </li>
-          )}
-
-          {filteredTasks.map((task) => (
-            <li
-              key={task.id}
-              className="group flex items-center gap-3 py-3 transition-all duration-200"
-            >
-              {/* ---------- Checkbox ---------- */}
-              <input
-                type="checkbox"
-                checked={task.completed}
-                onChange={() => toggleTask(task.id)}
-                aria-label={`標記「${task.text}」為${task.completed ? "未完成" : "完成"}`}
-                className="h-5 w-5 shrink-0 cursor-pointer rounded border-slate-300 accent-indigo-600 transition-all"
-              />
-
-              {/* ---------- Task body (edit or view) ---------- */}
-              {editingId === task.id ? (
-                <input
-                  ref={editRef}
-                  type="text"
-                  value={editingText}
-                  onChange={(e) => setEditingText(e.target.value)}
-                  onKeyDown={handleEditKeyDown}
-                  onBlur={saveEdit}
-                  aria-label="編輯任務內容"
-                  className="flex-1 rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-slate-800 outline-none ring-2 ring-indigo-100"
-                />
-              ) : (
-                <span
-                  onClick={() => startEditing(task)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") startEditing(task);
-                  }}
-                  tabIndex={0}
-                  role="button"
-                  aria-label={`編輯「${task.text}」`}
-                  className={`flex-1 cursor-text px-1 font-medium transition-colors ${
-                    task.completed
-                      ? "text-slate-400 line-through decoration-slate-300"
-                      : "text-slate-700 hover:text-indigo-700"
-                  }`}
-                >
-                  {task.text}
-                </span>
-              )}
-
-              {/* ---------- Delete button ---------- */}
-              <button
-                onClick={() => deleteTask(task.id)}
-                aria-label={`刪除「${task.text}」`}
-                className="shrink-0 rounded-lg p-2 text-slate-300 transition-all hover:bg-rose-50 hover:text-rose-500 active:scale-90 sm:opacity-0 sm:group-hover:opacity-100"
+          ) : (
+            filteredTasks.map((task) => (
+              <li
+                key={task.id}
+                className="group flex items-center gap-3 py-3 transition-all duration-200"
               >
-                <svg
-                  width="18"
-                  height="18"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden="true"
+                {/* ---------- Checkbox ---------- */}
+                <input
+                  type="checkbox"
+                  checked={task.completed}
+                  onChange={() => toggleTask(task.id)}
+                  aria-label={`標記「${task.text}」為${task.completed ? "未完成" : "完成"}`}
+                  className="h-5 w-5 shrink-0 cursor-pointer rounded border-slate-300 accent-indigo-600 transition-all"
+                />
+
+                {/* ---------- Task body (edit or view) ---------- */}
+                {editingId === task.id ? (
+                  <input
+                    ref={editRef}
+                    type="text"
+                    value={editingText}
+                    onChange={(e) => setEditingText(e.target.value)}
+                    onKeyDown={handleEditKeyDown}
+                    onBlur={saveEdit}
+                    aria-label="編輯任務內容"
+                    className="flex-1 rounded-lg border border-indigo-300 bg-white px-3 py-1.5 text-slate-800 outline-none ring-2 ring-indigo-100"
+                  />
+                ) : (
+                  <span
+                    onClick={() => startEditing(task)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") startEditing(task);
+                    }}
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`編輯「${task.text}」`}
+                    className={`flex-1 cursor-text px-1 font-medium transition-colors ${
+                      task.completed
+                        ? "text-slate-400 line-through decoration-slate-300"
+                        : "text-slate-700 hover:text-indigo-700"
+                    }`}
+                  >
+                    {task.text}
+                  </span>
+                )}
+
+                {/* ---------- Delete button ---------- */}
+                <button
+                  onClick={() => deleteTask(task.id)}
+                  aria-label={`刪除「${task.text}」`}
+                  className="shrink-0 rounded-lg p-2 text-slate-300 transition-all hover:bg-rose-50 hover:text-rose-500 active:scale-90 sm:opacity-0 sm:group-hover:opacity-100"
                 >
-                  <path d="M3 6h18" />
-                  <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
-                </svg>
-              </button>
-            </li>
-          ))}
+                  <svg
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 6h18" />
+                    <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+                  </svg>
+                </button>
+              </li>
+            ))
+          )}
         </ul>
 
         {/* ---------- Footer stats ---------- */}
         <footer className="flex items-center justify-between border-t border-slate-100 px-6 py-4 text-sm text-slate-500 sm:px-8">
           <span>
-            {activeCount > 0
-              ? `剩餘 ${activeCount} 項待完成`
-              : tasks.length > 0
-                ? "全部完成！🎉"
-                : "開始加入任務吧"}
+            {!hydrated
+              ? "載入中…"
+              : activeCount > 0
+                ? `剩餘 ${activeCount} 項待完成`
+                : tasks.length > 0
+                  ? "全部完成！🎉"
+                  : "開始加入任務吧"}
           </span>
           {completedCount > 0 && (
             <button
